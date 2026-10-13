@@ -1,176 +1,47 @@
-<div align="center">
+# sqltok
 
-<img src="assets/logo.png" alt="SQLTok logo" width="300" />
+**Your schema, minus the tokens you cannot afford.**
 
-<h1>SQLTok</h1>
+![sqltok](docs/hero.webp)
 
-<p><b>A schema token budget manager for Text-to-SQL.</b> Given a database and a question, SQLTok selects only the relevant tables and columns within a hard token budget and returns a compact schema string for the prompt.</p>
-
-<p>On BIRD mini-dev (500 questions): keeps <b>97%</b> of gold-query tables at a 2,000-token budget and cuts prompt input <b>36%</b> at 1,000 tokens, measured against the full-schema-dump baseline. Details in <a href="benchmarks/RESULTS.md">benchmarks/RESULTS.md</a>.</p>
-
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/Zion-sewers/sqltok/actions/workflows/ci.yml/badge.svg)](https://github.com/Zion-sewers/sqltok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/ShovalBenjer/sqltok/actions/workflows/ci.yml/badge.svg)](https://github.com/ShovalBenjer/sqltok/actions/workflows/ci.yml)
-[![Linting: Ruff](https://img.shields.io/badge/linting-ruff-261230.svg)](https://github.com/astral-sh/ruff)
-[![Typed: mypy](https://img.shields.io/badge/typed-mypy-2a6db2.svg)](https://mypy-lang.org/)
 
-</div>
+Text-to-SQL agents choke on big schemas. Dumping every table into the prompt burns tokens and buries the signal. sqltok is a schema token budget manager: given a database and a question, it picks the tables and columns that matter inside a hard token budget (measured with tiktoken) and returns a compact, joinable schema string for your prompt.
 
-## Contents
+Under the hood: keyword/BM25 value grounding, MinHash + banded LSH over table/column names and sampled cell values, greedy submodular coverage selection, FK-neighbor expansion, and FK-Steiner-tree bridge tables so the result stays joinable.
 
-1. [Installation](#installation)
-2. [Quickstart](#quickstart)
-3. [Features](#features)
-4. [Benchmark](#benchmark)
-5. [How it works](#how-it-works)
-6. [Architecture](#architecture)
-7. [Documentation](#documentation)
-8. [Contributing](#contributing)
-9. [Roadmap](#roadmap)
-10. [License](#license)
+On BIRD mini-dev (500 questions) at a 2,000-token budget: **97.4% full-recall** (all gold-query tables kept), 99.0% table recall, with **17.2% fewer total prompt tokens** than the full-schema-dump baseline. Numbers and reproduce commands in [benchmarks/RESULTS.md](benchmarks/RESULTS.md), caveats included.
 
-## Installation
-
-SQLTok is not on PyPI yet. Install from source:
+## 60 seconds
 
 ```bash
-git clone https://github.com/ShovalBenjer/sqltok.git
-cd sqltok
+git clone https://github.com/Zion-sewers/sqltok && cd sqltok
 pip install .
-```
-
-Optional extras:
-
-```bash
-pip install ".[embeddings]"  # sentence-transformers for dense retrieval
-pip install ".[benchmark]"   # anthropic, openai clients for live LLM runs
-pip install -e ".[dev]"       # pytest, hypothesis, ruff, mypy for contributors
-```
-
-Requires Python 3.11+.
-
-## Quickstart
-
-```python
+python - <<'EOF'
 from sqltok import SchemaBudgetManager
-
-mgr = SchemaBudgetManager.from_sqlite("path/to/db.sqlite")
-ctx = mgr.build_context(
-    question="What was the total order amount for customers in France?",
-    token_budget=2000,  # hard ceiling on schema-context tokens
-    include_sample_rows=True,  # one example row per included table
-)
-
-prompt = f"""Database schema:
-{ctx.text}
-
-Question: What was the total order amount for customers in France?
-SQLite query:"""
-
-print(ctx.tables)  # ['customers', 'orders']
-print(ctx.token_count)  # measured with tiktoken, at or below the budget
-print(ctx.bridge_tables)  # foreign-key bridges added to keep the schema joinable
-print(ctx.covered_weight)  # fraction of grounded question mentions covered
+mgr = SchemaBudgetManager.from_sqlite("benchmarks/sample_data/dev_databases/retail/retail.sqlite")
+ctx = mgr.build_context(question="total order amount for customers in France", token_budget=2000)
+print(ctx.text, ctx.tables, ctx.token_count)
+EOF
 ```
 
-See [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) for first-query walkthroughs, common patterns, and troubleshooting.
+A Streamlit demo lives at `demo/app.py`.
 
-## Features
+## What it does
 
-- **Value grounding**: MinHash + banded LSH over table names, column names, and sampled cell values. Finds mentions keyword search misses, like `"France"` in `customers.country`.
-- **Submodular budgeting**: Weighted maximum coverage with CELF lazy evaluation, giving a `(1 - 1/e)` approximation guarantee and automatic redundancy removal.
-- **FK Steiner connectivity**: Adds the minimal set of bridge tables so the selection is join-connected, preventing hallucinated joins.
-- **Hard token budget**: Every candidate is rendered and counted with `tiktoken` before committing. `token_count <= token_budget` is an invariant.
-- **Deterministic**: Fixed seeds, no network calls, no model required for selection.
-- **Framework-agnostic output**: A plain `CREATE TABLE`-style string that works with every LLM, every framework, and every prompt template.
+- Hard token budgets enforced with tiktoken, not vibes.
+- Value grounding: MinHash/LSH over names and sampled cell values finds the columns the question actually touches.
+- Joinability preserved: FK-Steiner bridges keep the selected tables connected.
+- Typed Python API (`py.typed`).
 
-## Benchmark
+## Honest limits
 
-The harness in [`benchmarks/`](benchmarks/) runs two arms with the same model and the same prompt template, differing only in the schema context: a baseline that sends the full schema dump, and SQLTok at budgets of 1000, 2000, and 4000 tokens. Execution accuracy is scored by the official BIRD script rather than a custom checker.
+- Schema-linking only. It does not write SQL and does not call an LLM.
+- Evaluation is BIRD mini-dev: small schemas. The headline savings do not transfer 1:1 to large enterprise DBs (the README's own RESULTS.md says this).
+- Precision ~40%: spare budget goes to likely join targets via FK-neighbor expansion.
+- sqlite entry point documented. Not on PyPI yet; install from source.
 
-Schema-linking recall (does SQLTok keep the tables the gold query needs). Full-recall is the rate at which every gold table is present, which is the ceiling on achievable execution accuracy.
+---
 
-| budget | table recall | full-recall rate | precision | avg tables |
-| ---: | ---: | ---: | ---: | ---: |
-| 1000 | 96.3% | 91.8% | 42.8% | 5.45 |
-| 2000 | 99.0% | 97.4% | 40.7% | 6.11 |
-| 4000 | 99.0% | 97.4% | 39.8% | 6.24 |
-
-Token reduction, measured with `tiktoken` (`cl100k_base`):
-
-| arm | schema tokens (mean) | total input tokens | total input reduction |
-| --- | ---: | ---: | ---: |
-| baseline (full dump) | 1161 | 629,819 | reference |
-| sqltok at 1000 | 703 | 401,285 | 36.3% |
-| sqltok at 2000 | 944 | 521,760 | 17.2% |
-| sqltok at 4000 | 1064 | 581,559 | 7.7% |
-
-Full numbers and an honest reading are in [benchmarks/RESULTS.md](benchmarks/RESULTS.md). The 500-question BIRD mini-dev run is deterministic and needs no model; execution accuracy against a real LLM is the pending frontier.
-
-## How it works
-
-SQLTok turns a schema, a question, and a budget into a budgeted, joinable schema string in four stages: value grounding, submodular budgeting, FK Steiner connectivity, and a tiktoken-measured budget guarantee. The math, the alternatives considered, and an illustrated walkthrough live outside this README:
-
-- [docs/DESIGN.md](docs/DESIGN.md) — why the design is the way it is
-- [docs/blog/visual-guide-to-sqltok.md](docs/blog/visual-guide-to-sqltok.md) — illustrated pipeline walkthrough
-- [docs/diagrams/](docs/diagrams/) — canonical Mermaid diagrams
-
-## Architecture
-
-```
-sqltok/
-  models.py          Schema, Table, Column, ForeignKey, and compact DDL rendering
-  tokenizer.py       tiktoken wrapper for real token counts
-  ddl.py             sqlglot CREATE TABLE parser
-  introspect.py      SQLite introspection and cell-value sampling
-  grounding/         Stage 1: native value grounding
-    text.py          mention extraction and character shingles
-    minhash.py       MinHash for Jaccard estimation
-    lsh.py           banded LSH for candidate generation
-    affinity.py      cover matrix and self-supervised IDF
-  select/            Stages 2 to 4: selection strategies
-    base.py          SchemaSelector protocol and BudgetPacker
-    coverage.py      CoverageSelector, the default submodular CELF greedy
-    connect.py       foreign-key Steiner connectivity
-    greedy.py        RelevanceGreedySelector, the BM25 baseline
-    stubs.py         rerank and agentic selectors for v0.2
-  manager.py         SchemaBudgetManager, the public API
-  context.py         SchemaContext, the result type
-```
-
-## Documentation
-
-| Section | Purpose |
-| --- | --- |
-| [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) | Installation, first query, common patterns, troubleshooting, real-world SQLite examples. |
-| [docs/API.md](docs/API.md) | Full reference for every public class, method, parameter, and data type. |
-| [docs/DESIGN.md](docs/DESIGN.md) | Why SQLTok exists, design decisions with alternatives, performance, and the Rust migration path. |
-| [docs/blog/visual-guide-to-sqltok.md](docs/blog/visual-guide-to-sqltok.md) | Illustrated walkthrough of the pipeline. |
-| [benchmarks/README.md](benchmarks/README.md) | How to run the benchmark harness. |
-| [RUNBOOK.md](RUNBOOK.md) | Execution steps: benchmarking, PyPI publishing, docs site deployment, social posting. |
-
-## Contributing
-
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
-
-```bash
-git clone https://github.com/ShovalBenjer/sqltok && cd sqltok
-pip install -e ".[dev]"
-python -m pytest
-ruff check . && mypy sqltok/
-```
-
-See [`docs/README.md`](docs/README.md) for the documentation contribution guide.
-
-## Roadmap
-
-1. SID semantic cache for canonicalized query reuse.
-2. Intent canonicalizer and invalidation tag registry.
-3. Cache backends (Redis, DuckDB).
-4. Additional selectors: cross-encoder rerank, LLM agentic discovery.
-5. Integrations for LangChain, LlamaIndex, Vanna.
-6. Rust core migration for speed and distribution (see [`docs/design/rust-rewrite-plan.md`](docs/design/rust-rewrite-plan.md)).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+Part of [Zion](https://github.com/Zion-sewers) — public infrastructure for trust in agents. The eval layer for the long-horizon era.
